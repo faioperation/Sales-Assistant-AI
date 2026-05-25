@@ -1,23 +1,25 @@
 """
 System Prompt Agent - Free-form advisor
+Claude Sonnet primary, GPT-4o fallback.
+Harmony response structure.
 """
 
-from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
 from rag.retriever import retrieve, format_context
 from nsr.rules import check
-from config import OPENAI_API_KEY, LLM_MODEL
+from agents.llm_provider import invoke_with_fallback, format_engine_notice
 
-llm = ChatOpenAI(
-    model=LLM_MODEL,
-    api_key=OPENAI_API_KEY,
-    temperature=0.5,
-)
 
 SYSTEM_PROMPT = """
 You are a smart sales and technical advisor for a freelance agency.
 
 Give direct, practical, actionable advice. Be honest about limitations.
+
+Format your response clearly:
+- Start with a short title line
+- Then give a flowing, conversational explanation
+- No unnecessary bullet lists unless comparing options
+- Be concise unless detail is requested
 """
 
 
@@ -51,16 +53,22 @@ def run(user_input: str,
 
     messages.append(HumanMessage(content=user_content))
 
-    response   = llm.invoke(messages)
-    output     = response.content
+    output, engine = invoke_with_fallback(
+        messages,
+        model_key="claude-sonnet",
+        temperature=0.5,
+    )
+    notice     = format_engine_notice(engine)
     violations = check(output)
+    final      = notice + output
 
     sections = [
-        {"id": "ai_advisor_response", "title": "AI Advisor Response", "content": output},
+        {"id": "ai_advisor_response", "title": "AI Advisor Response", "content": final},
     ]
 
     return {
         "sections":     sections,
         "nsr_warnings": violations,
-        "raw":          output,
+        "engine":       engine,
+        "raw":          final,
     }

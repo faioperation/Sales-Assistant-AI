@@ -1,20 +1,14 @@
 """
 Full Analysis Orchestrator
 ============================
-Page-aware routing system:
+Page-aware routing system with harmony response format.
 
-Frontend sends 'page_context' to indicate which page user is on:
-- 'sales_bot'         -> Fiverr Sales Bot agent (client analysis)
-- 'service_guide'     -> Service Guide agent OR Quotation generator
-- 'alternative_guide' -> Alternative Guide agent
-- 'system_prompt'     -> Free-form chat (or auto-routing)
-
-Within a page, agent decides between specific actions:
-- Service Guide page: detects 'quotation' keywords -> quotation mode
-- All pages: handles random follow-up chat with context
+Harmony Response:
+- All agents return: {sections, nsr_warnings, engine, raw}
+- Each section has title + flowing content (ChatGPT style)
+- Intelligent: only returns sections relevant to user's request
 """
 
-import re
 from concurrent.futures import ThreadPoolExecutor
 from agents import sales_bot, service_guide, alternative_guide, conversation
 from nsr.rules import check as nsr_check
@@ -36,9 +30,77 @@ QUOTATION_TRIGGERS = [
 
 
 def _is_quotation_request(text: str) -> bool:
-    """Detect if user wants a quotation generated."""
     text_lower = text.lower()
     return any(trigger in text_lower for trigger in QUOTATION_TRIGGERS)
+
+
+# ── Intelligent Section Filter ───────────────────
+
+SECTION_INTENT_MAP = {
+    # Sales bot
+    "client_summary":          ["client summary", "summary", "client overview", "who is the client"],
+    "technical_reality_check": ["reality check", "technical check", "is it possible", "feasibility"],
+    "red_flags":               ["red flag", "warning", "risk", "problem", "issue", "concern"],
+    "suggested_reply":         ["reply", "response", "what to say", "message draft", "suggested reply"],
+
+    # Service guide
+    "service_description":     ["what is", "service description", "overview"],
+    "how_it_works":            ["how it works", "how does it work", "process"],
+    "real_challenges":         ["challenge", "difficulty", "problem"],
+    "technical_limitations":   ["limitation", "limit", "constraint", "restriction"],
+    "recommended_stack":       ["tech stack", "technology", "tools", "recommended"],
+
+    # Quotation
+    "project_overview":        ["project overview", "overview"],
+    "phase_breakdown":         ["phase", "breakdown", "steps", "timeline"],
+    "tech_stack":              ["tech stack", "technology"],
+    "total_summary":           ["total", "price", "cost", "budget", "how much"],
+    "client_requirements":     ["client provides", "requirement", "what client"],
+    "additional_notes":        ["notes", "additional", "extra"],
+
+    # Alternative guide
+    "problem_identified":      ["problem", "issue", "what's wrong"],
+    "real_world_explanation":  ["explanation", "explain", "why"],
+    "best_alternative":        ["best alternative", "best option", "recommended"],
+    "budget_alternative":      ["budget", "cheap", "affordable", "low cost"],
+    "client_message_draft":    ["client message", "how to explain", "tell client"],
+}
+
+
+def _filter_sections(sections: list, user_message: str) -> list:
+    """
+    Return only sections relevant to user's request.
+    If no specific intent detected, return all sections.
+    """
+    msg_lower = user_message.lower()
+
+    matched_ids = set()
+    for section_id, keywords in SECTION_INTENT_MAP.items():
+        if any(kw in msg_lower for kw in keywords):
+            matched_ids.add(section_id)
+
+    if matched_ids:
+        filtered = [s for s in sections if s["id"] in matched_ids]
+        if filtered:
+            return filtered
+
+    return sections
+
+
+# ── Harmony Response Builder ─────────────────────
+
+def _build_harmony_response(sections: list) -> str:
+    """
+    Build a single flowing raw response from sections.
+    ChatGPT style: **Title** then content, step by step.
+    """
+    parts = []
+    for section in sections:
+        title   = section.get("title", "")
+        content = section.get("content", "").strip()
+        if content:
+            parts.append(f"**{title}**\n{content}")
+    return "\n\n".join(parts)
 
 
 # ── Main Entry ──────────────────────────────────
@@ -50,20 +112,8 @@ def run_full_analysis(
     model_key: str = None,
     page_context: str = None,
 ) -> dict:
-    """
-    Route based on frontend page + user intent.
-
-    Args:
-        conversation_text:    User's current message
-        conversation_history: Previous chat turns
-        is_follow_up:         Force follow-up mode
-        model_key:            Backend-decided model
-        page_context:         Current frontend page
-    """
     has_history    = bool(conversation_history) or is_follow_up
     client_context = _extract_client_context(conversation_history)
-
-    # ── Route by page_context ─────────────────────────
 
     if page_context == "sales_bot":
         return _handle_sales_bot_page(
@@ -85,7 +135,7 @@ def run_full_analysis(
             conversation_text, conversation_history, client_context, model_key
         )
 
-    # ── No page context: use intent classifier (legacy) ──
+    # No page context: use intent classifier
     intent = classify(conversation_text, has_history=has_history)
 
     if intent == "sales_analysis":
@@ -101,28 +151,24 @@ def run_full_analysis(
 def _handle_sales_bot_page(
     text: str, history: list, client_context: str, model_key: str
 ) -> dict:
-    """
-    Sales Bot page:
-    - First message (no history): Run sales_bot agent for client analysis
-    - Follow-up: Conversational (reply suggestions, strategy)
-    """
     if not history:
-        # First message - run sales bot analysis
-        result = sales_bot.run(conversation=text, model_key=model_key or "claude-sonnet")
+        result         = sales_bot.run(conversation=text, model_key=model_key or "claude-sonnet")
         input_warnings = nsr_check(text)
+        filtered       = _filter_sections(result["sections"], text)
+        harmony_raw    = _build_harmony_response(filtered)
 
         return {
-            "agent":  "sales_bot",
-            "intent": "sales_analysis",
-            "mode":   "analysis",
-            "page":   "sales_bot",
-            "engine": result.get("engine"),
-            "sections":     result["sections"],
-            "nsr_warnings": input_warnings,
+            "agent":                 "sales_bot",
+            "intent":                "sales_analysis",
+            "mode":                  "analysis",
+            "page":                  "sales_bot",
+            "engine":                result.get("engine"),
+            "sections":              filtered,
+            "nsr_warnings":          input_warnings,
             "combined_nsr_warnings": input_warnings,
+            "raw":                   harmony_raw,
         }
 
-    # Follow-up - conversational mode
     return _run_conversation(
         text, history, client_context,
         intent="sales_followup",
@@ -134,54 +180,49 @@ def _handle_sales_bot_page(
 def _handle_service_guide_page(
     text: str, history: list, client_context: str, model_key: str
 ) -> dict:
-    """
-    Service Guide page:
-    - Detect QUOTATION request -> run quotation generator
-    - First service question (no history): Run service_guide agent
-    - Follow-up: Conversational with tech context
-    """
-    # PRIORITY: Quotation detection
     if _is_quotation_request(text):
-        # Use client_context as service description if available
-        service_desc = client_context if client_context else text
-
-        result = service_guide.quotation(
+        service_desc   = client_context if client_context else text
+        result         = service_guide.quotation(
             service_description=service_desc,
             model_key=model_key or "claude-sonnet",
         )
         input_warnings = nsr_check(service_desc + " " + text)
+        filtered       = _filter_sections(result["sections"], text)
+        harmony_raw    = _build_harmony_response(filtered)
 
         return {
-            "agent":  "quotation",
-            "intent": "quotation_generation",
-            "mode":   "quotation",
-            "page":   "service_guide",
-            "engine": result.get("engine"),
-            "sections":     result["sections"],
-            "nsr_warnings": input_warnings,
+            "agent":                 "quotation",
+            "intent":                "quotation_generation",
+            "mode":                  "quotation",
+            "page":                  "service_guide",
+            "engine":                result.get("engine"),
+            "sections":              filtered,
+            "nsr_warnings":          input_warnings,
             "combined_nsr_warnings": input_warnings,
+            "raw":                   harmony_raw,
         }
 
-    # First service guide question - run service guide agent
     if not history:
-        result = service_guide.guide(
+        result         = service_guide.guide(
             service_description=text,
             model_key=model_key or "claude-sonnet",
         )
         input_warnings = nsr_check(text)
+        filtered       = _filter_sections(result["sections"], text)
+        harmony_raw    = _build_harmony_response(filtered)
 
         return {
-            "agent":  "service_guide",
-            "intent": "service_guide",
-            "mode":   "guide",
-            "page":   "service_guide",
-            "engine": result.get("engine"),
-            "sections":     result["sections"],
-            "nsr_warnings": input_warnings,
+            "agent":                 "service_guide",
+            "intent":                "service_guide",
+            "mode":                  "guide",
+            "page":                  "service_guide",
+            "engine":                result.get("engine"),
+            "sections":              filtered,
+            "nsr_warnings":          input_warnings,
             "combined_nsr_warnings": input_warnings,
+            "raw":                   harmony_raw,
         }
 
-    # Follow-up - conversational with tech context
     return _run_conversation(
         text, history, client_context,
         intent="tech_discussion",
@@ -193,27 +234,25 @@ def _handle_service_guide_page(
 def _handle_alternative_guide_page(
     text: str, history: list, client_context: str, model_key: str
 ) -> dict:
-    """
-    Alternative Guide page:
-    - First message: Run alternative_guide agent
-    - Follow-up: Conversational
-    """
     if not history:
-        result = alternative_guide.run(
+        result         = alternative_guide.run(
             problem_description=text,
             model_key=model_key or "claude-sonnet",
         )
         input_warnings = nsr_check(text)
+        filtered       = _filter_sections(result["sections"], text)
+        harmony_raw    = _build_harmony_response(filtered)
 
         return {
-            "agent":  "alternative_guide",
-            "intent": "alternative_guide",
-            "mode":   "alternative",
-            "page":   "alternative_guide",
-            "engine": result.get("engine"),
-            "sections":     result["sections"],
-            "nsr_warnings": input_warnings,
+            "agent":                 "alternative_guide",
+            "intent":                "alternative_guide",
+            "mode":                  "alternative",
+            "page":                  "alternative_guide",
+            "engine":                result.get("engine"),
+            "sections":              filtered,
+            "nsr_warnings":          input_warnings,
             "combined_nsr_warnings": input_warnings,
+            "raw":                   harmony_raw,
         }
 
     return _run_conversation(
@@ -227,11 +266,8 @@ def _handle_alternative_guide_page(
 def _handle_system_prompt_page(
     text: str, history: list, client_context: str, model_key: str
 ) -> dict:
-    """
-    System Prompt page: Free-form chat with auto intent detection.
-    """
     has_history = bool(history)
-    intent = classify(text, has_history=has_history)
+    intent      = classify(text, has_history=has_history)
 
     return _run_conversation(
         text, history, client_context,
@@ -244,9 +280,9 @@ def _handle_system_prompt_page(
 # ── Helper Runners ──────────────────────────────
 
 def _run_full_three_agents(text: str, model_key: str) -> dict:
-    """Run all 3 sales agents in parallel."""
+    """Run all 3 agents in parallel, merge into harmony response."""
     input_warnings = nsr_check(text)
-    chosen = model_key or "claude-sonnet"
+    chosen         = model_key or "claude-sonnet"
 
     with ThreadPoolExecutor(max_workers=3) as executor:
         sf = executor.submit(sales_bot.run, text, chosen)
@@ -254,23 +290,27 @@ def _run_full_three_agents(text: str, model_key: str) -> dict:
         af = executor.submit(alternative_guide.run, text, chosen)
         sr, gr, ar = sf.result(), gf.result(), af.result()
 
+    all_sections = sr["sections"] + gr["sections"] + ar["sections"]
+    filtered     = _filter_sections(all_sections, text)
+    harmony_raw  = _build_harmony_response(filtered)
+
     return {
-        "agent":  "full_analysis",
-        "intent": "sales_analysis",
-        "mode":   "analysis",
-        "model_requested": chosen,
+        "agent":                 "full_analysis",
+        "intent":                "sales_analysis",
+        "mode":                  "analysis",
+        "engine":                sr.get("engine"),
+        "sections":              filtered,
+        "nsr_warnings":          input_warnings,
+        "combined_nsr_warnings": input_warnings,
+        "raw":                   harmony_raw,
         "agents": [
             {"agent_name": "sales_bot",         "agent_title": "Fiverr Sales Bot",
-             "engine": sr.get("engine"), "sections": sr["sections"],
-             "nsr_warnings": input_warnings},
+             "engine": sr.get("engine"), "sections": sr["sections"]},
             {"agent_name": "service_guide",     "agent_title": "Service Guide",
-             "engine": gr.get("engine"), "sections": gr["sections"],
-             "nsr_warnings": input_warnings},
+             "engine": gr.get("engine"), "sections": gr["sections"]},
             {"agent_name": "alternative_guide", "agent_title": "Alternative Guide",
-             "engine": ar.get("engine"), "sections": ar["sections"],
-             "nsr_warnings": input_warnings},
+             "engine": ar.get("engine"), "sections": ar["sections"]},
         ],
-        "combined_nsr_warnings": input_warnings,
     }
 
 
@@ -278,25 +318,27 @@ def _run_conversation(
     text: str, history: list, client_context: str,
     intent: str, model_key: str, page: str = None,
 ) -> dict:
-    """Run conversational agent with given intent."""
-    result = conversation.run(
+    result      = conversation.run(
         user_message=text,
         conversation_history=history or [],
         client_context=client_context,
         intent=intent,
         model_key=model_key,
     )
+    filtered    = _filter_sections(result["sections"], text)
+    harmony_raw = _build_harmony_response(filtered)
 
     return {
-        "agent":  "full_analysis",
-        "intent": intent,
-        "mode":   "conversation",
-        "page":   page,
-        "engine": result["engine"],
-        "response":     result["response"],
-        "sections":     result["sections"],
-        "nsr_warnings": result.get("nsr_warnings", []),
+        "agent":                 "full_analysis",
+        "intent":                intent,
+        "mode":                  "conversation",
+        "page":                  page,
+        "engine":                result["engine"],
+        "response":              result["response"],
+        "sections":              filtered,
+        "nsr_warnings":          result.get("nsr_warnings", []),
         "combined_nsr_warnings": result.get("nsr_warnings", []),
+        "raw":                   harmony_raw,
     }
 
 

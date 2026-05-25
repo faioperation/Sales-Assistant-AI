@@ -23,3 +23,5 @@ CHROMA_COLLECTION = os.getenv("CHROMA_COLLECTION", "sales_assistant")
 # ── RAG ────────────────────────────────────────
 EMBEDDING_MODEL = "all-MiniLM-L6-v2"
 TOP_K           = 5
+# ── Agent Training API ─────────────────────────
+TRAINING_API_URL = os.getenv("TRAINING_API_URL")

@@ -1,8 +1,18 @@
+"""
+RAG Retriever
+=============
+Retrieves relevant chunks from ChromaDB (old knowledge)
+AND merges admin training data (new knowledge) into one context.
+
+Agents call format_context() as before — no changes needed in agents.
+"""
+
 import chromadb
 from sentence_transformers import SentenceTransformer
 from config import (CHROMA_API_KEY, CHROMA_TENANT,
                     CHROMA_DATABASE, CHROMA_COLLECTION,
                     EMBEDDING_MODEL, TOP_K)
+from rag.training_retriever import get_training_context
 
 
 _client     = None
@@ -71,11 +81,34 @@ def retrieve(query: str, k: int = TOP_K,
 
 
 def format_context(chunks: list[dict]) -> str:
-    if not chunks:
-        return "No relevant knowledge found."
-    lines = []
-    for i, c in enumerate(chunks, 1):
-        lines.append(f"[{i}] (source: {c['source']}, score: {c['score']})")
-        lines.append(c["text"])
-        lines.append("")
-    return "\n".join(lines)
+    """
+    Build final context string for agents.
+
+    Combines:
+    1. ChromaDB RAG chunks (existing knowledge base)
+    2. Admin training data — prompts + PDF documents (new knowledge)
+
+    Agents receive both automatically on every request.
+    """
+    sections = []
+
+    # ── 1. ChromaDB knowledge base ───────────────
+    if chunks:
+        lines = ["=== KNOWLEDGE BASE ==="]
+        for i, c in enumerate(chunks, 1):
+            lines.append(f"[{i}] (source: {c['source']}, score: {c['score']})")
+            lines.append(c["text"])
+            lines.append("")
+        sections.append("\n".join(lines))
+    else:
+        sections.append("=== KNOWLEDGE BASE ===\nNo relevant knowledge found.")
+
+    # ── 2. Admin training data ───────────────────
+    try:
+        training_ctx = get_training_context()
+        if training_ctx:
+            sections.append(training_ctx)
+    except Exception as e:
+        print(f"[Retriever] Training context fetch failed (continuing): {e}")
+
+    return "\n\n".join(sections)
