@@ -11,3 +11,5 @@ anthropic
 python-dotenv
 fastapi
 uvicorn
+pypdf
+ddgs

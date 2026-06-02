@@ -7,12 +7,20 @@ Harmony Response:
 - All agents return: {sections, nsr_warnings, engine, raw}
 - Each section has title + flowing content (ChatGPT style)
 - Intelligent: only returns sections relevant to user's request
+
+Vision Flow:
+- If image_data is provided, vision agent runs FIRST
+- Vision output + RAG context is injected into all downstream agents
+- All agents (sales_bot, service_guide, alternative_guide, conversation)
+  receive the enriched vision context automatically
 """
 
 from concurrent.futures import ThreadPoolExecutor
 from agents import sales_bot, service_guide, alternative_guide, conversation
+from agents import vision as vision_agent
 from nsr.rules import check as nsr_check
 from orchestrator.intent_classifier import classify
+from rag.web_retriever import should_web_search, retrieve_and_analyze
 
 
 # ── Quotation Detection ──────────────────────────
@@ -64,14 +72,13 @@ SECTION_INTENT_MAP = {
     "best_alternative":        ["best alternative", "best option", "recommended"],
     "budget_alternative":      ["budget", "cheap", "affordable", "low cost"],
     "client_message_draft":    ["client message", "how to explain", "tell client"],
+
+    # Vision
+    "image_analysis":          ["image", "screenshot", "photo", "picture", "what is this", "analyze image"],
 }
 
 
 def _filter_sections(sections: list, user_message: str) -> list:
-    """
-    Return only sections relevant to user's request.
-    If no specific intent detected, return all sections.
-    """
     msg_lower = user_message.lower()
 
     matched_ids = set()
@@ -90,10 +97,6 @@ def _filter_sections(sections: list, user_message: str) -> list:
 # ── Harmony Response Builder ─────────────────────
 
 def _build_harmony_response(sections: list) -> str:
-    """
-    Build a single flowing raw response from sections.
-    ChatGPT style: **Title** then content, step by step.
-    """
     parts = []
     for section in sections:
         title   = section.get("title", "")
@@ -101,6 +104,56 @@ def _build_harmony_response(sections: list) -> str:
         if content:
             parts.append(f"**{title}**\n{content}")
     return "\n\n".join(parts)
+
+
+# ── Vision Pre-Processing ────────────────────────
+
+def _run_vision_if_needed(
+    image_data: str,
+    user_input: str,
+) -> tuple[str, list]:
+    """
+    Run vision agent if image_data is present.
+
+    Returns:
+        (vision_context, vision_sections)
+        vision_context: enriched text to inject into all agents
+        vision_sections: sections to prepend to final response
+    """
+    if not image_data:
+        return "", []
+
+    print("[FullAnalysis] Image detected — running vision agent first...")
+    vision_result = vision_agent.analyze(
+        image_data=image_data,
+        user_question=user_input,
+    )
+
+    vision_context  = vision_result.get("vision_context", vision_result.get("raw", ""))
+    vision_sections = vision_result.get("sections", [])
+
+    return vision_context, vision_sections
+
+
+# ── Inject Vision Context into User Input ────────
+
+def _enrich_input_with_vision(
+    user_input: str,
+    vision_context: str,
+) -> str:
+    """
+    Prepend vision context to user input so all agents
+    receive the full picture (image analysis + RAG).
+    """
+    if not vision_context:
+        return user_input
+
+    return (
+        f"[IMAGE CONTEXT FROM VISION ANALYSIS]\n"
+        f"{vision_context}\n\n"
+        f"[USER REQUEST]\n"
+        f"{user_input}"
+    )
 
 
 # ── Main Entry ──────────────────────────────────
@@ -111,39 +164,63 @@ def run_full_analysis(
     is_follow_up: bool = False,
     model_key: str = None,
     page_context: str = None,
+    image_data: str = "",
 ) -> dict:
     has_history    = bool(conversation_history) or is_follow_up
     client_context = _extract_client_context(conversation_history)
 
+    # ── Step 1: Vision pre-processing ────────────
+    vision_context, vision_sections = _run_vision_if_needed(image_data, conversation_text)
+
+    # Enrich the conversation text with vision output
+    # so ALL agents automatically get image context
+    enriched_text = _enrich_input_with_vision(conversation_text, vision_context)
+
+    # ── Step 2: Route to appropriate agent ───────
     if page_context == "sales_bot":
-        return _handle_sales_bot_page(
-            conversation_text, conversation_history, client_context, model_key
+        result = _handle_sales_bot_page(
+            enriched_text, conversation_history, client_context, model_key
         )
 
-    if page_context == "service_guide":
-        return _handle_service_guide_page(
-            conversation_text, conversation_history, client_context, model_key
+    elif page_context == "service_guide":
+        result = _handle_service_guide_page(
+            enriched_text, conversation_history, client_context, model_key
         )
 
-    if page_context == "alternative_guide":
-        return _handle_alternative_guide_page(
-            conversation_text, conversation_history, client_context, model_key
+    elif page_context == "alternative_guide":
+        result = _handle_alternative_guide_page(
+            enriched_text, conversation_history, client_context, model_key
         )
 
-    if page_context == "system_prompt":
-        return _handle_system_prompt_page(
-            conversation_text, conversation_history, client_context, model_key
+    elif page_context == "system_prompt":
+        result = _handle_system_prompt_page(
+            enriched_text, conversation_history, client_context, model_key
         )
 
-    # No page context: use intent classifier
-    intent = classify(conversation_text, has_history=has_history)
+    else:
+        intent = classify(enriched_text, has_history=has_history)
 
-    if intent == "sales_analysis":
-        return _run_full_three_agents(conversation_text, model_key)
+        # Web search check — even for sales_analysis intent
+        if should_web_search(enriched_text):
+            result = _run_web_search_flow(
+                enriched_text, conversation_history, client_context, intent
+            )
+        elif intent == "sales_analysis":
+            result = _run_full_three_agents(enriched_text, model_key)
+        else:
+            result = _run_conversation(
+                enriched_text, conversation_history, client_context, intent, model_key
+            )
 
-    return _run_conversation(
-        conversation_text, conversation_history, client_context, intent, model_key
-    )
+    # ── Step 3: Prepend vision sections to response ─
+    if vision_sections:
+        result["sections"]      = vision_sections + result.get("sections", [])
+        result["vision_used"]   = True
+        result["raw"]           = _build_harmony_response(result["sections"])
+    else:
+        result["vision_used"] = False
+
+    return result
 
 
 # ── Page Handlers ───────────────────────────────
@@ -278,6 +355,67 @@ def _handle_system_prompt_page(
 
 
 # ── Helper Runners ──────────────────────────────
+
+
+def _run_web_search_flow(
+    text: str, history: list, client_context: str, intent: str
+) -> dict:
+    """
+    Web search pipeline for any intent when user requests latest/search info.
+    Works for sales_analysis, sales_followup, tech_discussion, general_chat.
+    """
+    print(f"[FullAnalysis] Web search triggered for intent: {intent}")
+
+    extra_parts = []
+    if client_context:
+        extra_parts.append(f"CLIENT CONTEXT:\n{client_context}")
+    if history:
+        recent = history[-4:]
+        history_text = "\n".join(
+            f"{m.get('role','').upper()}: {m.get('content','')}"
+            for m in recent if m.get("content")
+        )
+        if history_text:
+            extra_parts.append(f"RECENT CONVERSATION:\n{history_text}")
+
+    extra_context = "\n\n".join(extra_parts)
+
+    web_result = retrieve_and_analyze(
+        user_query=text,
+        extra_context=extra_context,
+    )
+
+    answer  = web_result.get("answer", "")
+    sources = web_result.get("sources", [])
+
+    sources_text = ""
+    if sources:
+        source_lines = ["\n\n**Sources:**"]
+        for s in sources:
+            source_lines.append(f"- [{s['source_type']}] {s['title']} -> {s['url']}")
+        sources_text = "\n".join(source_lines)
+
+    final      = answer + sources_text
+    violations = nsr_check(text + " " + answer)
+
+    return {
+        "agent":                 "web_search",
+        "intent":                intent,
+        "mode":                  "web_search",
+        "engine":                "openai_web_search",
+        "web_search_used":       True,
+        "sources":               sources,
+        "sections": [
+            {
+                "id":      "web_search_result",
+                "title":   "Web Search Result",
+                "content": final,
+            }
+        ],
+        "nsr_warnings":          violations,
+        "combined_nsr_warnings": violations,
+        "raw":                   final,
+    }
 
 def _run_full_three_agents(text: str, model_key: str) -> dict:
     """Run all 3 agents in parallel, merge into harmony response."""

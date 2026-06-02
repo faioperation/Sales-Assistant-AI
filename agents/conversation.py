@@ -1,25 +1,20 @@
 """
 Conversational Agent (Dual Engine with Auto-Fallback)
 ========================================================
-Smart conversation with engine selection based on intent:
+Smart conversation with engine selection based on intent.
 
-- sales_followup  -> Claude primary (with client context + RAG)
-- tech_discussion -> Claude primary (with RAG knowledge base)
-- general_chat    -> OpenAI primary (no RAG, fast general knowledge)
-- sales_analysis  -> Should not reach here (handled by full_analysis)
-
-Features:
-- Automatic engine fallback via centralized llm_provider
-- Engine notice prepended when fallback is used
-- Knowledge base retrieval only when relevant
-- Conversation history (last 10 turns)
-- NSR safety check on combined context
+Web Search Feature:
+- Triggered when user uses search keywords
+- Searches StackOverflow, Medium, Reddit via DuckDuckGo
+- Analyzed by OpenAI GPT-4o
+- Works for ALL intents including sales_analysis
 """
 
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
 from rag.retriever import retrieve, format_context
 from nsr.rules import check
 from agents.llm_provider import invoke_with_fallback, format_engine_notice
+from rag.web_retriever import should_web_search, retrieve_and_analyze
 
 
 # ── System Prompts ───────────────────────────────
@@ -78,6 +73,19 @@ GUIDELINES:
 - Stay friendly and conversational
 """
 
+WEB_SEARCH_PROMPT = """
+You are a smart sales and technical assistant with access to real-time web search results
+from StackOverflow, Medium, and Reddit.
+
+Your job:
+- Use the web search results to answer the user's question accurately
+- Connect findings to their sales or technical situation
+- Mention sources where relevant (StackOverflow answer, Medium article, Reddit discussion)
+- Be honest if results are not fully relevant
+
+Always provide practical, actionable insights based on what was found.
+"""
+
 
 # ── Intent Config ────────────────────────────────
 
@@ -103,11 +111,18 @@ INTENT_CONFIG = {
         "use_client_context": False,
         "temperature":        0.6,
     },
+    # sales_analysis can also reach here when web search is triggered
+    "sales_analysis": {
+        "default_model":      "claude-sonnet",
+        "prompt":             SALES_FOLLOWUP_PROMPT,
+        "use_rag":            True,
+        "use_client_context": True,
+        "temperature":        0.5,
+    },
 }
 
 
 def _get_config(intent: str) -> dict:
-    """Return config for given intent, default to general_chat."""
     return INTENT_CONFIG.get(intent, INTENT_CONFIG["general_chat"])
 
 
@@ -118,30 +133,24 @@ def run(user_message: str,
         client_context: str = "",
         intent: str = "general_chat",
         model_key: str = None) -> dict:
-    """
-    Handle a conversational turn with the appropriate engine.
 
-    Args:
-        user_message:         Current user message
-        conversation_history: List of {"role": str, "content": str}
-        client_context:       Original client conversation (for follow-ups)
-        intent:               Detected intent from classifier
-
-    Returns:
-        {
-            "response":     str,        # with engine notice if fallback used
-            "engine":       str,        # 'claude', 'openai', 'openai_fallback', etc.
-            "intent":       str,
-            "sections":     list,
-            "nsr_warnings": list,
-        }
-    """
     cfg = _get_config(intent)
 
-    # Build message chain
+    # ── Web Search Check ─────────────────────────
+    # If user wants latest/search info, bypass normal RAG
+    # and use DuckDuckGo → fetch → OpenAI pipeline
+    if should_web_search(user_message):
+        return _run_with_web_search(
+            user_message=user_message,
+            conversation_history=conversation_history,
+            client_context=client_context,
+            intent=intent,
+        )
+
+    # ── Normal RAG Flow ──────────────────────────
     messages = [SystemMessage(content=cfg["prompt"])]
 
-    # Add knowledge base context if needed
+    # Add RAG knowledge base context
     if cfg["use_rag"]:
         try:
             chunks  = retrieve(query=user_message, k=3)
@@ -171,33 +180,99 @@ def run(user_message: str,
             elif role == "assistant":
                 messages.append(AIMessage(content=content))
 
-    # Add current user message
     messages.append(HumanMessage(content=user_message))
 
-    # Use frontend-chosen model if provided, otherwise use intent default
     chosen_model = model_key or cfg["default_model"]
 
-    # Invoke with centralized fallback logic
     output, engine = invoke_with_fallback(
         messages,
         model_key=chosen_model,
         temperature=cfg["temperature"],
     )
 
-    # Prepend engine notice if fallback was used
     notice       = format_engine_notice(engine)
     final_output = notice + output
 
-    # NSR safety check on combined context
     combined_text = user_message + " " + output + " " + (client_context or "")
     violations    = check(combined_text)
 
     return {
-        "response":     final_output,
-        "engine":       engine,
-        "intent":       intent,
+        "response":        final_output,
+        "engine":          engine,
+        "intent":          intent,
+        "web_search_used": False,
         "sections": [
             {"id": "ai_response", "title": "AI Response", "content": final_output},
+        ],
+        "nsr_warnings": violations,
+    }
+
+
+# ── Web Search Flow ──────────────────────────────
+
+def _run_with_web_search(
+    user_message: str,
+    conversation_history: list,
+    client_context: str,
+    intent: str,
+) -> dict:
+    """
+    Handle web search requests:
+    DuckDuckGo search → fetch content → OpenAI analysis
+    """
+    print(f"[Conversation] Web search triggered for intent: {intent}")
+
+    # Build extra context from conversation history + client context
+    extra_parts = []
+
+    if client_context:
+        extra_parts.append(f"CLIENT CONTEXT:\n{client_context}")
+
+    if conversation_history:
+        recent = conversation_history[-4:]
+        history_text = "\n".join(
+            f"{m.get('role', '').upper()}: {m.get('content', '')}"
+            for m in recent
+            if m.get("content")
+        )
+        if history_text:
+            extra_parts.append(f"RECENT CONVERSATION:\n{history_text}")
+
+    extra_context = "\n\n".join(extra_parts)
+
+    # Run web retrieval + analysis
+    web_result = retrieve_and_analyze(
+        user_query=user_message,
+        extra_context=extra_context,
+    )
+
+    answer  = web_result.get("answer", "")
+    sources = web_result.get("sources", [])
+
+    # Format sources as readable text
+    sources_text = ""
+    if sources:
+        source_lines = ["\n\n**Sources:**"]
+        for s in sources:
+            source_lines.append(f"- [{s['source_type']}] {s['title']} → {s['url']}")
+        sources_text = "\n".join(source_lines)
+
+    final_output = answer + sources_text
+
+    violations = check(user_message + " " + answer)
+
+    return {
+        "response":        final_output,
+        "engine":          "openai_web_search",
+        "intent":          intent,
+        "web_search_used": True,
+        "sources":         sources,
+        "sections": [
+            {
+                "id":      "web_search_result",
+                "title":   "Web Search Result",
+                "content": final_output,
+            },
         ],
         "nsr_warnings": violations,
     }
