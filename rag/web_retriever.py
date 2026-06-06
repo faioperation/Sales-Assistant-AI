@@ -7,6 +7,15 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from config import OPENAI_API_KEY
 
 
+# ── Feature flag ─────────────────────────────────
+# Web search is currently DISABLED.
+# Set to True to re-enable the DuckDuckGo → fetch → OpenAI pipeline.
+# When False, should_web_search() always returns False, so every
+# caller falls through to its normal RAG flow. All pipeline code
+# below stays intact and ready to use.
+WEB_SEARCH_ENABLED = False
+
+
 # ── LLM for analysis ────────────────────────────
 
 llm = ChatOpenAI(
@@ -72,6 +81,8 @@ Do NOT hallucinate. Only use what's in the provided content.
 
 def should_web_search(text: str) -> bool:
     """Check if user message contains web search triggers."""
+    if not WEB_SEARCH_ENABLED:
+        return False
     text_lower = text.lower()
     return any(trigger in text_lower for trigger in WEB_SEARCH_TRIGGERS)
 
